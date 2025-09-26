@@ -1,0 +1,17 @@
+protocol "GPU_VIPER_CXL_MESIF";
+
+
+include "GPU_VIPER_CXL_MESIF_dma-msg.sm";
+include "GPU_VIPER_CXL_MESIF_dma.sm";
+
+include "MESIF_CXL_msg.sm";
+include "CXL_dir.sm";
+include "MESIF_CXL_proxy.sm";
+include "MESIF_cache1.sm";
+
+include "GPU_VIPER-msg.sm";
+include "GPU_VIPER-TCP.sm";
+include "GPU_VIPER-SQC.sm";
+include "GPU_VIPER-TCC_CXL.sm";
+
+

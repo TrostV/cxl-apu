@@ -1,0 +1,1814 @@
+/*
+ * Edited by Victor Fritz Trost (c) 2025 - edits under the MIT license
+ *
+ * Copyright (c) 2010-2015 Advanced Micro Devices, Inc.
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice,
+ * this list of conditions and the following disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ * this list of conditions and the following disclaimer in the documentation
+ * and/or other materials provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of its
+ * contributors may be used to endorse or promote products derived from this
+ * software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ *
+ * Author: Blake Hechtman
+ */
+
+machine(MachineType:TCC, "TCC Cache")
+ : CacheMemory * L2cache;
+   Cycles l2_response_latency := 1;
+   Cycles glc_atomic_latency := 0;
+   Cycles recycleLatency := 10;
+
+
+  // CXL Buffers:
+  MessageBuffer *bisnpTo, network="To", virtual_network="6", vnet_type="bisnp";
+  MessageBuffer *bisnpFrom, network="From", virtual_network="6", vnet_type="bisnp";
+  MessageBuffer *birspTo, network="To", virtual_network="7", vnet_type="birsp";
+  MessageBuffer *birspFrom, network="From", virtual_network="7", vnet_type="birsp";
+
+  MessageBuffer *ndrTo, network="To", virtual_network="8", vnet_type="ndr";
+  MessageBuffer *ndrFrom, network="From", virtual_network="8", vnet_type="ndr";
+  MessageBuffer *drsTo, network="To", virtual_network="9", vnet_type="drs";
+  MessageBuffer *drsFrom, network="From", virtual_network="9", vnet_type="drs";
+
+  MessageBuffer *req2To, network="To", virtual_network="10", vnet_type="req2";
+  MessageBuffer *req2From, network="From", virtual_network="10", vnet_type="req2";
+  MessageBuffer *rwdTo, network="To", virtual_network="11", vnet_type="rwd";
+  MessageBuffer *rwdFrom, network="From", virtual_network="11", vnet_type="rwd";
+
+  // From the TCPs or SQCs
+  MessageBuffer * requestFromTCP, network="From", virtual_network="1", vnet_type="request";
+  // To the Cores. TCC deals only with TCPs/SQCs.
+  MessageBuffer * responseToCore, network="To", virtual_network="3", vnet_type="response";
+
+{
+  // EVENTS
+  enumeration(Event, desc="TCC Events") {
+    // Requests coming from the CUs
+    RD_SLC,        desc="Read SLC scope";
+    RD_GLC,        desc="Read GLC scope";
+    ST_SLC,        desc="Store SLC scope";
+    ST_GLC,        desc="Store GLC scope";
+    Atomic_SLC,    desc="Atomic SLC scope";
+    Atomic_GLC,    desc="Atomic GLC scope";
+    Flush,         desc="Flush cache entry";
+    InvCache,      desc="Invalidating probe from TCP";
+
+    // CXL incoming events
+    CmpE,          desc="CXL Exclusive Completion (CmpE) event";
+    CmpS,          desc="CXL Shared Completion (CmpS) event";
+    Cmp,           desc="CXL Completion (Cmp) event";
+    Data,          desc="CXL Data event";
+    
+    BISnpInv,      desc="CXL BISnpInv event";
+    BISnpData,     desc="CXL BISnpData event";
+    BIConflictAck, desc="CXL BIConflictAck event";
+
+    // Cache Initiated events
+    L2_Repl,       desc="L2 Replacement";
+
+  }
+  Tick cyclesToTicks(Cycles c);
+  // STATES
+  state_declaration(State, desc="TCC State", default="TCC_State_I__C__I") {
+    // Stable states
+    // SLC
+    I__C__M, AccessPermission:Read_Write, desc="Invalid - Modified";
+    I__C__E, AccessPermission:Read_Only,  desc="Invalid - Exclusive";
+    I__C__S, AccessPermission:Read_Only,  desc="Invalid - Shared";
+    I__C__I, AccessPermission:Invalid,    desc="Invalid - Invalid";
+    // GLC - clean
+    V__C__M, AccessPermission:Read_Write, desc="Valid - Modified  (GLC)";
+    V__C__E, AccessPermission:Read_Only,  desc="Valid - Exclusive (GLC)";
+    V__C__S, AccessPermission:Read_Only,  desc="Valid - Shared    (GLC)";
+    V__C__P, AccessPermission:Read_Write, desc="Valid - Present, not coherent (GLC)";
+    // GLC - dirty 
+    M__C__E, AccessPermission:Read_Write, desc="Modified - Exclusive (GLC)";
+    M__C__P, AccessPermission:Read_Write, desc="Modified - Present, not coherent (GLC)";
+
+    // Transient states
+    // SLC
+    I__C__IS,        AccessPermission:Busy, desc="Invalid - waiting for Shared data";
+    I__C__IE_CmpE,   AccessPermission:Busy, desc="Invalid - got CmpE, waiting for data";
+    I__C__IS_CmpS,   AccessPermission:Busy, desc="Invalid - got CmpS, waiting for data";
+    I__C__SM,        AccessPermission:Busy, desc="Invalid - Shared to Modified";
+    I__C__IM,        AccessPermission:Busy, desc="Invalid - waiting for Modified data";
+    I__C__IM_CmpE,   AccessPermission:Busy, desc="Invalid - got CmpE, waiting for Modified data";
+    I__C__PM,        AccessPermission:Busy, desc="Invalid - Present to Modified writeback";
+    I__C__PM_RD,     AccessPermission:Busy, desc="Invalid - Present to Modified read";
+    I__C__PM_RD_CmpE,AccessPermission:Busy, desc="Invalid - got CmpE, waiting for data";
+    I__C__PM_CmpE,   AccessPermission:Busy, desc="Invalid - got CmpE, waiting for Modified data";
+    //GLC
+    V__C__IP,      AccessPermission:Busy, desc="Valid - waiting for Present data";
+    V__C__IP_Cmp,  AccessPermission:Busy, desc="Valid - got Cmp, waiting for data";
+    M__C__MP,      AccessPermission:Busy, desc="Modified - waiting for Present completion";
+    M__C__SP,      AccessPermission:Busy, desc="Modified - Shared to Present";
+    M__C__IP,      AccessPermission:Busy, desc="Modified - waiting for Present data";
+    M__C__IP_Cmp,  AccessPermission:Busy, desc="Modified - got Cmp, waiting for data";
+    // Atomic 
+    I__C__SM_atomic,      AccessPermission:Busy, desc="Shared to Modified for atomic";
+    I__C__IM_atomic,      AccessPermission:Busy, desc="Invalid to Modified for atomic";
+    I__C__IM_atomic_CmpE, AccessPermission:Busy, desc="IM atomic got CmpE";
+    I__C__PM_atomic,      AccessPermission:Busy, desc="Present to Modified for atomic";
+    I__C__PM_atomic_CmpE,AccessPermission:Busy, desc="PM atomic got CmpE";
+    M__C__SP_atomic,      AccessPermission:Busy, desc="Shared to Present for atomic";  
+    M__C__IP_atomic,      AccessPermission:Busy, desc="Invalid to Present for atomic";
+    M__C__IP_atomic_Cmp,  AccessPermission:Busy, desc="IP atomic got Cmp";
+    // Replacement
+    I__C__SI_repl,     AccessPermission:Busy, desc="Invalid - Shared to Invalid on replacement";
+    I__C__MI_repl,     AccessPermission:Busy, desc="Invalid - Modified to Invalid on replacement";
+    I__C__PM_repl,     AccessPermission:Busy, desc="Invalid - Present to Invalid on replacement";
+    I__C__PM_repl_CmpE,AccessPermission:Busy, desc="Invalid - got CmpE, waiting for data on replacement";
+    // Flush
+    V__C__P_flush,      AccessPermission:Busy, desc="Valid - Present to Invalid on flush";
+    V__C__P_flush_CmpE, AccessPermission:Busy, desc="Valid - got CmpE, waiting for data on flush";
+
+    // Eviction
+    I__C__MI_BISnpInv, AccessPermission:Busy, desc="Invalid - Modified to Invalid on BISnpInv";
+    V__C__MP_BISnpInv, AccessPermission:Busy, desc="Valid - Modified to Present on BISnpInv";
+    I__C__MS_BISnpData, AccessPermission:Busy, desc="Invalid - Modified to Shared on BISnpData";
+    V__C__MS_BISnpData, AccessPermission:Busy, desc="Valid - Modified to Shared on BISnpData";
+    
+
+  }
+
+  enumeration(RequestType, desc="To communicate stats from transitions to recordStats") {
+    DataArrayRead,         desc="Read the data array";
+    DataArrayWrite,        desc="Write the data array";
+    TagArrayRead,          desc="Read the tag array";
+    TagArrayWrite,         desc="Write the tag array";
+    AtomicALUOperation,    desc="Atomic ALU operation";
+  }
+
+
+  // STRUCTURES
+
+  structure(Entry, desc="...", interface="AbstractCacheEntry") {
+    State CacheState,          desc="cache state";
+    bool Dirty,                desc="Is the data dirty (diff from memory?)";
+    DataBlock DataBlk,         desc="Data for the block";
+    WriteMask writeMask,       desc="Dirty byte mask";
+  }
+
+  structure(TBE, desc="...") {
+    State TBEState,            desc="Transient state";
+    DataBlock DataBlk,         desc="data for the block";
+    bool Dirty,                desc="Is the data dirty?";
+    bool Shared,               desc="Victim hit by shared probe";
+    MachineID From,            desc="Waiting for writeback from...";
+    NetDest Destination,       desc="Data destination";
+    int numPending,            desc="num pending requests";
+    int atomicDoneCnt,         desc="number AtomicDones triggered";
+    bool atomicDataReturn,     desc="Got Atomic op and need return value?", default="false";
+    bool atomicDataNoReturn,   desc="Got Atomic op and don't need return value?", default="false";
+    bool isGLCSet,             desc="Bypass L1 Cache";
+    bool isSLCSet,             desc="Bypass L1 and L2 Cache";
+    WriteMask atomicWriteMask, desc="Atomic write mask";
+    WriteMask writeMask,       desc="Dirty byte mask";
+    uint64_t instSeqNum,       desc="Instruction sequence number";
+  }
+
+  structure(TBETable, external="yes") {
+    TBE lookup(Addr);
+    void allocate(Addr);
+    void deallocate(Addr);
+    bool isPresent(Addr);
+    bool areNSlotsAvailable(int, Tick);
+  }
+
+  TBETable TBEs, template="<TCC_TBE>", constructor="m_number_of_TBEs";
+
+  void set_cache_entry(AbstractCacheEntry b);
+  void unset_cache_entry();
+  void set_tbe(TBE b);
+  void unset_tbe();
+  void wakeUpAllBuffers();
+  void wakeUpBuffers(Addr a);
+  void wakeUpAllBuffers(Addr a);
+
+  MachineID mapAddressToMachine(Addr addr, MachineType mtype);
+
+  // FUNCTION DEFINITIONS
+  Tick clockEdge();
+
+  Entry getCacheEntry(Addr addr), return_by_pointer="yes" {
+    return static_cast(Entry, "pointer", L2cache.lookup(addr));
+  }
+
+  DataBlock getDataBlock(Addr addr), return_by_ref="yes" {
+    return getCacheEntry(addr).DataBlk;
+  }
+
+  DataBlock getCacheBlock(TBE tbe, Entry cache_entry, Addr LineAddress) {
+    if (is_valid(cache_entry)) {
+        return cache_entry.DataBlk;
+    }
+    else if (is_valid(tbe) && tbe.Dirty) {
+        return tbe.DataBlk;
+    } else {
+        error("block not present");
+    }
+  }
+
+  bool presentOrAvail(Addr addr) {
+    return L2cache.isTagPresent(addr) || L2cache.cacheAvail(addr);
+  }
+
+  State getState(TBE tbe, Entry cache_entry, Addr addr) {
+    if (is_valid(tbe)) {
+      return tbe.TBEState;
+    } else if (is_valid(cache_entry)) {
+      return cache_entry.CacheState;
+    }
+    return State:I__C__I;
+  }
+
+  void setState(TBE tbe, Entry cache_entry, Addr addr, State state) {
+    if (is_valid(tbe)) {
+        tbe.TBEState := state;
+    }
+
+    if (is_valid(cache_entry)) {
+        cache_entry.CacheState := state;
+    }
+  }
+
+  void functionalRead(Addr addr, Packet *pkt) {
+    TBE tbe := TBEs.lookup(addr);
+    Entry cache_entry := getCacheEntry(addr);
+    if(is_valid(tbe)) {
+      testAndRead(addr, tbe.DataBlk, pkt);
+    } else if (is_valid(cache_entry)) {
+      testAndRead(addr, cache_entry.DataBlk, pkt);
+    } else {
+      functionalMemoryRead(pkt);
+    }
+  }
+
+  int functionalWrite(Addr addr, Packet *pkt) {
+    int num_functional_writes := 0;
+    TBE tbe := TBEs.lookup(addr);
+    if(is_valid(tbe)) {
+      num_functional_writes := num_functional_writes +
+            testAndWrite(addr, tbe.DataBlk, pkt);
+    }
+
+    num_functional_writes := num_functional_writes +
+        functionalMemoryWrite(pkt);
+    return num_functional_writes;
+  }
+
+  AccessPermission getAccessPermission(Addr addr) {
+    TBE tbe := TBEs.lookup(addr);
+    if(is_valid(tbe)) {
+      return TCC_State_to_permission(tbe.TBEState);
+    }
+
+    Entry cache_entry := getCacheEntry(addr);
+    if(is_valid(cache_entry)) {
+      return TCC_State_to_permission(cache_entry.CacheState);
+    }
+
+    return AccessPermission:NotPresent;
+  }
+
+  void setAccessPermission(Entry cache_entry, Addr addr, State state) {
+    if (is_valid(cache_entry)) {
+      cache_entry.changePermission(TCC_State_to_permission(state));
+    }
+  }
+
+  void recordRequestType(RequestType request_type, Addr addr) {
+    if (request_type == RequestType:DataArrayRead) {
+        L2cache.recordRequestType(CacheRequestType:DataArrayRead, addr);
+    } else if (request_type == RequestType:DataArrayWrite) {
+        L2cache.recordRequestType(CacheRequestType:DataArrayWrite, addr);
+    } else if (request_type == RequestType:TagArrayRead) {
+        L2cache.recordRequestType(CacheRequestType:TagArrayRead, addr);
+    } else if (request_type == RequestType:TagArrayWrite) {
+        L2cache.recordRequestType(CacheRequestType:TagArrayWrite, addr);
+    } else if (request_type == RequestType:AtomicALUOperation) {
+        L2cache.recordRequestType(CacheRequestType:AtomicALUOperation, addr);
+    }
+  }
+
+  bool checkResourceAvailable(RequestType request_type, Addr addr) {
+    if (request_type == RequestType:DataArrayRead) {
+      return L2cache.checkResourceAvailable(CacheResourceType:DataArray, addr);
+    } else if (request_type == RequestType:DataArrayWrite) {
+      return L2cache.checkResourceAvailable(CacheResourceType:DataArray, addr);
+    } else if (request_type == RequestType:TagArrayRead) {
+      return L2cache.checkResourceAvailable(CacheResourceType:TagArray, addr);
+    } else if (request_type == RequestType:TagArrayWrite) {
+      return L2cache.checkResourceAvailable(CacheResourceType:TagArray, addr);
+    } else if (request_type == RequestType:AtomicALUOperation) {
+      return L2cache.checkResourceAvailable(CacheResourceType:AtomicALUArray, addr);
+    } else {
+      error("Invalid RequestType type in checkResourceAvailable");
+      return true;
+    }
+  }
+
+
+  // ** OUT_PORTS **
+
+  // Three classes of ports
+  // Class 1: downward facing network links to CXL
+  out_port(birspto_out, CoherenceMessage, birspTo);
+  out_port(bisnpto_out, CoherenceMessage, bisnpTo);
+  out_port(drsto_out,   CoherenceMessage, drsTo);
+  out_port(ndrto_out,   CoherenceMessage, ndrTo);
+  out_port(req2to_out,  CoherenceMessage, req2To);
+  out_port(rwdto_out,   CoherenceMessage, rwdTo);
+  
+
+  // Class 2: upward facing ports to GPU cores
+  out_port(responseToCore_out, ResponseMsg, responseToCore);
+
+  in_port(coreRequestNetwork_in, CPURequestMsg, requestFromTCP, rank=0) {
+    if (coreRequestNetwork_in.isReady(clockEdge())) {
+      peek(coreRequestNetwork_in, CPURequestMsg) {
+        Addr LineAddress := in_msg.addr;
+        TBE tbe := TBEs.lookup(LineAddress);
+        Entry cache_entry := getCacheEntry(LineAddress);
+
+        DPRINTF(RubySlicc, "coreRequestNetwork_in: %s %s %s (SLC:%d)(addr: %#x)\n", in_msg.Type, in_msg.Requestor, getState(tbe, cache_entry, LineAddress), in_msg.isSLCSet, LineAddress);
+        if (in_msg.Type == CoherenceRequestType:WriteThrough) {
+            if (in_msg.isSLCSet) {
+                // The request should bypass the cache if SLC bit is set.
+                // If the cache entry exists already, then evict it.
+                // Else, perform a normal cache access.
+                // The cache entry is allocated only on response and bypass is
+                // handled there
+                if(presentOrAvail(LineAddress)) {
+                  trigger(Event:ST_SLC, in_msg.addr, cache_entry, tbe);
+                } else {
+                  Addr victim :=  L2cache.cacheProbe(LineAddress);
+
+                  tbe := TBEs.lookup(victim);
+                  if (getAccessPermission(victim) != AccessPermission:Busy
+                      || (is_invalid(tbe) && !TBEs.areNSlotsAvailable(1, clockEdge()))) {
+                    trigger(Event:L2_Repl, victim, getCacheEntry(victim), tbe);
+                  } else {
+                    DPRINTF(RubySlicc, "Cannot evict victim addr %#x for %#x. Recycling\n", victim, LineAddress);
+                    // recycle the request
+                    coreRequestNetwork_in.recycle(clockEdge(), cyclesToTicks(recycleLatency));
+                  }
+                }
+            } else {
+                if(presentOrAvail(LineAddress)) {
+                  trigger(Event:ST_GLC, LineAddress, cache_entry, tbe);
+                } else {
+                  Addr victim :=  L2cache.cacheProbe(LineAddress);
+                 if (getAccessPermission(victim) != AccessPermission:Busy
+                      || (is_invalid(tbe) && !TBEs.areNSlotsAvailable(1, clockEdge()))) {
+                    trigger(Event:L2_Repl, victim, getCacheEntry(victim), TBEs.lookup(victim));
+                  } else {
+                    DPRINTF(RubySlicc, "Cannot evict victim addr %#x for %#x. Recycling\n", victim, LineAddress);
+                    // recycle the request
+                    coreRequestNetwork_in.recycle(clockEdge(), cyclesToTicks(recycleLatency));
+                  }
+                }
+            }
+        } else if (in_msg.Type == CoherenceRequestType:Atomic ||
+                   in_msg.Type == CoherenceRequestType:AtomicReturn ||
+                   in_msg.Type == CoherenceRequestType:AtomicNoReturn) {
+          /*
+            If there are pending requests for this line already and those
+            requests are not atomics, because we can't easily differentiate
+            between different request types on return and because decrementing
+            the atomic count assumes all returned requests in the A state are
+            atomics, we will need to put this atomic to sleep and wake it up
+            when the loads return.
+            */
+            if(in_msg.isSLCSet) {
+              trigger(Event:Atomic_SLC, LineAddress, cache_entry, tbe);
+            } else {
+              trigger(Event:Atomic_GLC, LineAddress, cache_entry, tbe);
+            }
+        } else if (in_msg.Type == CoherenceRequestType:RdBlk) {
+          if (in_msg.isSLCSet) {
+            // If SLC bit is set, the request needs to go directly to memory.
+            // If a cache block already exists, then evict it.
+            if(presentOrAvail(LineAddress)) {
+              trigger(Event:RD_SLC, LineAddress, cache_entry, tbe);
+            } else {
+              Addr victim :=  L2cache.cacheProbe(LineAddress);
+              if (getAccessPermission(victim) != AccessPermission:Busy
+                      || (is_invalid(tbe) && !TBEs.areNSlotsAvailable(1, clockEdge()))) {
+                trigger(Event:L2_Repl, victim, getCacheEntry(victim), TBEs.lookup(victim));
+              } else {
+                DPRINTF(RubySlicc, "Cannot evict victim addr %#x for %#x. Recycling\n", victim, LineAddress);
+                // recycle the request
+                coreRequestNetwork_in.recycle(clockEdge(), cyclesToTicks(recycleLatency));
+              }
+            }
+          } else {
+            if(presentOrAvail(LineAddress)) {
+              trigger(Event:RD_GLC, LineAddress, cache_entry, tbe);
+            } else {
+              Addr victim :=  L2cache.cacheProbe(LineAddress);
+              if (getAccessPermission(victim) != AccessPermission:Busy
+                      || (is_invalid(tbe) && !TBEs.areNSlotsAvailable(1, clockEdge()))) {
+                trigger(Event:L2_Repl, victim, getCacheEntry(victim), TBEs.lookup(victim));
+              } else {
+                DPRINTF(RubySlicc, "Cannot evict victim addr %#x for %#x. Recycling\n", victim, LineAddress);
+                // recycle the request
+                coreRequestNetwork_in.recycle(clockEdge(), cyclesToTicks(recycleLatency));
+              }
+            }
+          }
+        } else if (in_msg.Type == CoherenceRequestType:WriteFlush) {
+            trigger(Event:Flush, LineAddress, cache_entry, tbe);
+        } else if (in_msg.Type == CoherenceRequestType:InvCache) {
+            trigger(Event:InvCache, LineAddress, cache_entry, tbe);
+        } else {
+          DPRINTF(RubySlicc, "%s\n", in_msg);
+          error("Unexpected Response Message to Core");
+        }
+      }
+    }
+  }
+
+  in_port(ndrfrom_in, CoherenceMessage, ndrFrom, rank=1) {
+    if (ndrfrom_in.isReady(clockEdge())) {
+      peek (ndrfrom_in, CoherenceMessage, block_on="LineAddress") {
+        Addr LineAddress := in_msg.LineAddress;
+        TBE tbe := TBEs[LineAddress];
+        State st := getState(tbe, getCacheEntry(LineAddress), LineAddress);
+        DPRINTF(RubySlicc, "ndrfrom_in: %s %s %s (addr: %#x)\n", in_msg.Type, in_msg.Sender, st, LineAddress);
+
+        if (in_msg.Type == CoherenceMessageType:Cmp_EL2) {
+          trigger(Event:CmpE, LineAddress, getCacheEntry(LineAddress), tbe);
+        } else if (in_msg.Type == CoherenceMessageType:Cmp_SL2) {
+          trigger(Event:CmpS, LineAddress, getCacheEntry(LineAddress), tbe);
+        } else if (in_msg.Type == CoherenceMessageType:CmpL2) {
+          trigger(Event:Cmp, LineAddress, getCacheEntry(LineAddress), tbe);
+        } else if (in_msg.Type == CoherenceMessageType:BIConflictAckL2) {    
+          trigger(Event:BIConflictAck, LineAddress, getCacheEntry(LineAddress), tbe);
+        } else {
+          error("Unexpected Coherence Message to TCC on ndrfrom_in");
+        }
+      }
+    }
+  }
+
+  in_port(drsfrom_in, CoherenceMessage, drsFrom, rank=2) {
+    if (drsfrom_in.isReady(clockEdge())) {
+      peek (drsfrom_in, CoherenceMessage, block_on="LineAddress") {
+        Addr LineAddress := in_msg.LineAddress;
+        TBE tbe := TBEs[LineAddress];
+        State st := getState(tbe, getCacheEntry(LineAddress), LineAddress);
+        DPRINTF(RubySlicc, "drsfrom_in: %s %s %s (addr: %#x)\n", in_msg.Type, in_msg.Sender, st, LineAddress);
+        if(in_msg.Type == CoherenceMessageType:MemDataL2) {
+          trigger(Event:Data, LineAddress, getCacheEntry(LineAddress), tbe);
+        } else {
+          error("Unexpected Coherence Message to TCC on drsfrom_in");
+        }
+      }
+    }
+  }
+
+  in_port(bisnpfrom_in, CoherenceMessage, bisnpFrom, rank=3) {
+      if (bisnpfrom_in.isReady(clockEdge())) {
+        peek (bisnpfrom_in, CoherenceMessage) {
+          Addr LineAddress := in_msg.LineAddress;
+          TBE tbe := TBEs[LineAddress];
+          State st := getState(tbe, getCacheEntry(LineAddress), LineAddress);
+          DPRINTF(RubySlicc, "bisnpfrom_in: %s %s %s (addr: %#x)\n", in_msg.Type, in_msg.Sender, st, LineAddress);
+
+          if(in_msg.Type == CoherenceMessageType:BISnpDataL2) {
+            trigger(Event:BISnpData, LineAddress, getCacheEntry(LineAddress), tbe);
+          } else if (in_msg.Type == CoherenceMessageType:BISnpInvL2) {
+            trigger(Event:BISnpInv, LineAddress, getCacheEntry(LineAddress), tbe);
+          } else {
+            error("Unexpected Coherence Message to TCC on bisnpfrom_in");
+          }
+        }
+      }
+  }
+
+
+  // BEGIN ACTIONS
+
+  action(i_invL2, "i", desc="invalidate TCC cache block") {
+    if (is_valid(cache_entry)) {
+        L2cache.deallocate(address);
+    }
+    unset_cache_entry();
+  }
+
+  action(ir_invL2Resp, "ir", desc="send L2 invalidate ack") {
+    peek(coreRequestNetwork_in, CPURequestMsg) {
+      enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:InvL2Resp;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.MessageSize := MessageSizeType:Response_Control;
+        DPRINTF(RubySlicc, "%s\n", out_msg);
+      }
+    }
+  }
+
+  action(sd_sendData, "sd", desc="send Shared response") {
+    peek(coreRequestNetwork_in, CPURequestMsg) {
+      enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:TDSysResp;
+        out_msg.Sender := machineID;
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.DataBlk := cache_entry.DataBlk;
+        out_msg.MessageSize := MessageSizeType:Response_Data;
+        out_msg.Dirty := false;
+        out_msg.State := CoherenceState:Shared;
+        out_msg.isGLCSet := in_msg.isGLCSet;
+        out_msg.isSLCSet := in_msg.isSLCSet;
+        DPRINTF(RubySlicc, "%s\n", out_msg);
+      }
+    }
+  }
+
+
+  action(sdr_sendDataResponse, "sdr", desc="send Shared response") {
+    enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+      assert(is_valid(tbe));
+      out_msg.addr := address;
+      out_msg.Type := CoherenceResponseType:TDSysResp;
+      out_msg.Sender := machineID;
+      out_msg.MessageSize := MessageSizeType:Response_Data;
+      out_msg.Dirty := false;
+      out_msg.State := CoherenceState:Shared;
+      peek(drsfrom_in, CoherenceMessage) {
+        out_msg.DataBlk  := in_msg.cl;
+        out_msg.isGLCSet := tbe.isGLCSet;
+        out_msg.isSLCSet := tbe.isSLCSet;
+        out_msg.Destination := tbe.Destination; 
+      }
+      DPRINTF(RubySlicc, "%s\n", out_msg);
+    }
+  }
+
+
+  action(w_sendResponseWBAck, "w", desc="send WB Ack") {
+      if (!is_valid(tbe)) {
+          DPRINTF(RubySlicc, "tbe is invalid for w_sendResponseWBAck: %s\n", getState(tbe, cache_entry, address));
+          error("Assert failed: tbe is invalid for w_sendResponseWBAck");
+      }
+      enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:TDSysWBAck;
+        out_msg.Destination := tbe.Destination;
+        out_msg.Sender := machineID;
+        out_msg.MessageSize := MessageSizeType:Writeback_Control;
+        out_msg.instSeqNum := tbe.instSeqNum;
+      }
+  }
+
+  action(swb_sendWBAck, "swb", desc="send WB Ack") {
+    peek(coreRequestNetwork_in, CPURequestMsg) {
+      enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:TDSysWBAck;
+        out_msg.Destination.clear();
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.Sender := machineID;
+        out_msg.MessageSize := MessageSizeType:Writeback_Control;
+        out_msg.instSeqNum := in_msg.instSeqNum;
+      }
+    }
+  }
+
+  action(fw_sendFlushResponse, "fw", desc="send Flush Response") {
+    peek(coreRequestNetwork_in, CPURequestMsg) {
+      enqueue(responseToCore_out, ResponseMsg, l2_response_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:TDSysWBAck;
+        out_msg.Destination.clear();
+        out_msg.Destination.add(in_msg.Requestor);
+        out_msg.Sender := machineID;
+        out_msg.MessageSize := MessageSizeType:Writeback_Control;
+        out_msg.instSeqNum := in_msg.instSeqNum;
+      }
+    }
+  }
+
+  action(ar_sendAtomicResponse, "ar", desc="send Atomic Ack") {
+    peek(coreRequestNetwork_in, CPURequestMsg) {
+        enqueue(responseToCore_out, ResponseMsg, l2_response_latency + glc_atomic_latency, true) {
+          out_msg.addr := address;
+          out_msg.Type := CoherenceResponseType:TDSysResp;
+          out_msg.Destination.clear();
+          out_msg.Destination.add(in_msg.Requestor);
+          out_msg.Sender := machineID;
+          out_msg.MessageSize := MessageSizeType:Response_Data;
+          out_msg.instSeqNum := in_msg.instSeqNum;
+          out_msg.DataBlk := cache_entry.DataBlk;
+          out_msg.isGLCSet := in_msg.isGLCSet;
+          out_msg.isSLCSet := in_msg.isSLCSet;
+        }
+    }
+    cache_entry.DataBlk.clearAtomicLogEntries();
+  }
+
+  action(a_allocateBlock, "a", desc="allocate TCC block") {
+    if (is_invalid(cache_entry)) {
+      if(!L2cache.cacheAvail(address)) {
+        DPRINTF(RubySlicc, "No space in TCC for address %#lx (%s)\n", address, getState(tbe, cache_entry, address));
+        error("Can't allocate TCC entry, no space available");
+      }
+      set_cache_entry(L2cache.allocate(address, new Entry));
+      cache_entry.writeMask.clear();
+    }
+  }
+
+  action(p_profileMiss, "pm", desc="Profile cache miss") {
+      L2cache.profileDemandMiss();
+      DPRINTF(RubyHitMiss, "in TCC miss at %#lx\n", address);
+  }
+
+  action(p_profileHit, "ph", desc="Profile cache hit") {
+      L2cache.profileDemandHit();
+      DPRINTF(RubyHitMiss, "in TCC hit at %#lx\n", address);
+  }
+
+  action(t_allocateTBE, "t", desc="allocate TBE Entry") {
+
+    if (is_invalid(tbe)) {
+      check_allocate(TBEs);
+      TBEs.allocate(address);
+      set_tbe(TBEs.lookup(address));
+      tbe.Destination.clear();
+      tbe.atomicDoneCnt := 0;
+      tbe.numPending := 0;
+    }
+    // each pending requests increments this count by 1
+    tbe.numPending := tbe.numPending + 1;
+    if (coreRequestNetwork_in.isReady(clockEdge())) {
+      peek(coreRequestNetwork_in, CPURequestMsg) {
+        if(in_msg.Type == CoherenceRequestType:RdBlk ||
+           in_msg.Type == CoherenceRequestType:Atomic ||
+           in_msg.Type == CoherenceRequestType:AtomicReturn ||
+           in_msg.Type == CoherenceRequestType:AtomicNoReturn ||
+           in_msg.Type == CoherenceRequestType:WriteThrough){
+          tbe.Destination.add(in_msg.Requestor);
+        }
+        tbe.isGLCSet := in_msg.isGLCSet;
+        tbe.isSLCSet := in_msg.isSLCSet;
+        tbe.instSeqNum := in_msg.instSeqNum;
+        if(in_msg.Type == CoherenceRequestType:Atomic ||
+           in_msg.Type == CoherenceRequestType:AtomicReturn ||
+           in_msg.Type == CoherenceRequestType:AtomicNoReturn){
+          tbe.atomicWriteMask.clear();
+          tbe.atomicWriteMask.orMask(in_msg.writeMask);
+        } else if (in_msg.Type == CoherenceRequestType:WriteThrough) {
+          tbe.DataBlk := in_msg.DataBlk;
+          tbe.writeMask.orMask(in_msg.writeMask);
+        }
+        tbe.atomicDataReturn := in_msg.Type == CoherenceRequestType:AtomicReturn;
+        tbe.atomicDataNoReturn := in_msg.Type == CoherenceRequestType:AtomicNoReturn;
+      }
+    }
+  }
+
+  action(dt_deallocateTBE, "dt", desc="Deallocate TBE entry") {
+    assert(is_valid(tbe));
+    // since we may have multiple destinations, can't deallocate if we aren't
+    // last one
+    tbe.numPending := tbe.numPending - 1;
+    if (tbe.numPending == 0) {
+      tbe.Destination.clear();
+      TBEs.deallocate(address);
+      unset_tbe();
+    }
+  }
+
+  action(wdb_writeDirtyBytes, "wdb", desc="write data to TCC") {
+    peek(coreRequestNetwork_in, CPURequestMsg) {
+      cache_entry.DataBlk.copyPartial(in_msg.DataBlk,in_msg.writeMask);
+      cache_entry.writeMask.orMask(in_msg.writeMask);
+      DPRINTF(RubySlicc, "Writing to TCC: %s\n", in_msg);
+    }
+  }
+  action(wdbr_writeDirtyBytesResp, "wdbr", desc="write data to TCC") {
+    assert(is_valid(tbe));
+    cache_entry.DataBlk.copyPartial(tbe.DataBlk,tbe.writeMask);
+    cache_entry.writeMask.orMask(tbe.writeMask);
+    DPRINTF(RubySlicc, "Writing to TCC from tbe\n");
+  }
+
+  action(owm_orWriteMask, "owm", desc="or TCCs write mask") {
+    peek(coreRequestNetwork_in, CPURequestMsg) {
+      cache_entry.writeMask.orMask(in_msg.writeMask);
+    }
+  }
+
+
+  action(ut_updateTag, "ut", desc="update Tag (i.e. set MRU)") {
+    L2cache.setMRU(address);
+  }
+
+  action(p_popRequestQueue, "p", desc="pop request queue") {
+    coreRequestNetwork_in.dequeue(clockEdge());
+  }
+
+
+  action(st_stallAndWaitRequest, "st", desc="Stall and wait on the address") {
+    DPRINTF(RubySlicc, "Stalling coreRequestNetwork_in for address %#x\n", address);
+    stall_and_wait(coreRequestNetwork_in, address);
+  }
+  action(stD_stallAndWaitData, "std", desc="Stall and wait on the address") {
+    DPRINTF(RubySlicc, "Stalling drsfrom_in for address %#x\n", address);
+    stall_and_wait(drsfrom_in, address);
+  }
+  action(stB_stallAndWaitBI, "stb", desc="Stall and wait on the address") {
+    DPRINTF(RubySlicc, "Stalling bisnpfrom_in for address %#x\n", address);
+    stall_and_wait(bisnpfrom_in, address);
+  }
+
+  action(wada_wakeUpAllDependentsAddr, "wada", desc="Wake up any requests waiting for this address") {
+    wakeUpAllBuffers(address);
+  }
+
+  /*
+    Currently z_stall is unused because it can lead to Protocol Stalls that
+    eventually lead to deadlock.  Instead, it is recommended to use
+    st_stallAndWaitRequest in combination with a wakeupBuffer call (e.g.,
+    wada_wakeUpAllDependentsAddr) to put the pending requests to sleep instead of
+    them causing head of line blocking -- wada_wakeUpAllDependentsAddr should wake
+    the request up once the request preventing it from completing is done.
+  action(z_stall, "z", desc="stall") {
+      // built-in
+  }
+  */
+
+  action(dadc_decrementAtomicDoneCnt, "dadc", desc="decrement atomics done cnt flag") {
+    assert(is_valid(tbe));
+    tbe.atomicDoneCnt := tbe.atomicDoneCnt - 1;
+  }
+
+  action(pa_performAtomic, "pa", desc="Perform atomic") {
+    if (is_valid(tbe) && tbe.atomicDataReturn) {
+       cache_entry.DataBlk.atomicPartial(cache_entry.DataBlk, cache_entry.writeMask, false);
+    } else if (is_valid(tbe) && tbe.atomicDataNoReturn) {
+       cache_entry.DataBlk.atomicPartial(cache_entry.DataBlk, cache_entry.writeMask, true);
+    } else {
+      peek(coreRequestNetwork_in, CPURequestMsg) {
+        if (in_msg.Type == CoherenceRequestType:AtomicReturn) {
+           cache_entry.DataBlk.atomicPartial(cache_entry.DataBlk, cache_entry.writeMask, false);
+        } else {
+          assert(in_msg.Type == CoherenceRequestType:AtomicNoReturn);
+          cache_entry.DataBlk.atomicPartial(cache_entry.DataBlk, cache_entry.writeMask, true);
+        }
+      }
+    }
+  }
+
+
+  action(mrs_MemRdS, "mrs", desc="CXL MemRd with Meta:S, SnpData (GetS)" ) {
+    peek(coreRequestNetwork_in, CPURequestMsg) {
+      enqueue(req2to_out, CoherenceMessage, l2_response_latency) {
+        out_msg.LineAddress := address;
+        out_msg.MessageSize := MessageSizeType:Control;
+        out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+        out_msg.Type := CoherenceMessageType:MemRd_S_SnpDataL2;
+        out_msg.Sender := machineID;
+      }
+    }
+  }
+  action(mrsc_MemRdSnpCur, "mrsc", desc="CXL MemRd with SnpCur (Non caching load)") {
+    peek(coreRequestNetwork_in, CPURequestMsg) {
+      enqueue(req2to_out, CoherenceMessage, l2_response_latency) {
+        out_msg.LineAddress := address;
+        out_msg.MessageSize := MessageSizeType:Control;
+        out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+        out_msg.Type := CoherenceMessageType:MemRd_SnpCur; //TODO CXL: Dont think this is implenented currenly
+        out_msg.Sender := machineID;
+      }
+    }
+  }
+  action(mra_MemRdA, "mra", desc="CXL MemRd with Meta:A, SnpInv (GetM)") {
+    peek(coreRequestNetwork_in, CPURequestMsg) {
+      enqueue(req2to_out, CoherenceMessage, l2_response_latency) {
+        out_msg.LineAddress := address;
+        out_msg.MessageSize := MessageSizeType:Control;
+        out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+        out_msg.Type := CoherenceMessageType:MemRd_A_SnpInvL2;
+        out_msg.Sender := machineID;
+      }
+    }
+  }
+  action(mia_MemInvA, "mia", desc="CXL MemInv with Meta:A (GetM without data response)") {
+    peek(coreRequestNetwork_in, CPURequestMsg) {
+      enqueue(req2to_out, CoherenceMessage, l2_response_latency) {
+        out_msg.LineAddress := address;
+        out_msg.MessageSize := MessageSizeType:Control;
+        out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+        out_msg.Type := CoherenceMessageType:MemInv_A_SnpInvL2;
+        out_msg.Sender := machineID;
+      }
+    }
+  }
+  
+  action(mwi_MemWrI, "mwi", desc="CXL MemWr with Meta:I (wb+putX)") {
+    assert(is_valid(tbe));
+    //peek(coreRequestNetwork_in, CPURequestMsg) {
+      enqueue(rwdto_out, CoherenceMessage, l2_response_latency) {
+        out_msg.LineAddress := address;
+        out_msg.MessageSize := MessageSizeType:Control;
+        out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+        out_msg.Type := CoherenceMessageType:MemWr_IL2;
+        out_msg.Sender := machineID;
+        out_msg.cl := getCacheBlock(tbe, getCacheEntry(address), address);
+      }
+    //}
+  }
+
+  action(mws_MemWrS, "mws", desc="CXL MemWr with Meta:S (wb+downgrade)") {
+    assert(is_valid(tbe));
+      enqueue(rwdto_out, CoherenceMessage, l2_response_latency) {
+        out_msg.LineAddress := address;
+        out_msg.MessageSize := MessageSizeType:Control;
+        out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+        out_msg.Type := CoherenceMessageType:MemWr_SL2;
+        out_msg.Sender := machineID;
+        out_msg.cl := getCacheBlock(tbe, getCacheEntry(address), address);
+      }
+  }
+  action(ce_CleanEvict, "ce", desc="CXL Clean Evict") {
+    peek(coreRequestNetwork_in, CPURequestMsg) {
+      enqueue(req2to_out, CoherenceMessage, l2_response_latency) {
+        out_msg.LineAddress := address;
+        out_msg.MessageSize := MessageSizeType:Control;
+        out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+        out_msg.Type := CoherenceMessageType:MemClnEvct_IL2;
+        out_msg.Sender := machineID;
+      }
+    }
+  }
+  action(bic_BIConflict, "bic", desc="CXL BIConflict") {
+    enqueue(rwdto_out, CoherenceMessage, l2_response_latency) {
+      out_msg.LineAddress := address;
+      out_msg.MessageSize := MessageSizeType:Control;
+      out_msg.Destination.add(mapAddressToMachine(address, MachineType:Directory));
+      out_msg.Type := CoherenceMessageType:BIConflictL2;
+      out_msg.Sender := machineID;
+    }
+  }
+  action(birI_BIRspI, "birI", desc="CXL BIRspI") {
+    peek(ndrfrom_in, CoherenceMessage) {
+      enqueue(birspto_out, CoherenceMessage, l2_response_latency) {
+        out_msg.LineAddress := in_msg.LineAddress;
+        out_msg.MessageSize := MessageSizeType:Control;
+        out_msg.Destination.add(in_msg.Sender);
+        out_msg.Type := CoherenceMessageType:BIRspIL2;
+        out_msg.Sender := machineID;
+      }
+    }
+  }
+  action(birIB_BIRspI, "birIB", desc="CXL BIRspI after bisnp") {
+    peek(bisnpfrom_in, CoherenceMessage) {
+      enqueue(birspto_out, CoherenceMessage, l2_response_latency) {
+        out_msg.LineAddress := in_msg.LineAddress;
+        out_msg.MessageSize := MessageSizeType:Control;
+        out_msg.Destination.add(in_msg.Sender);
+        out_msg.Type := CoherenceMessageType:BIRspIL2;
+        out_msg.Sender := machineID;
+      }
+    }
+  }
+
+  action(birS_BIRspS, "birS", desc="CXL BIRspS") {
+    peek(ndrfrom_in, CoherenceMessage) {
+      enqueue(birspto_out, CoherenceMessage, l2_response_latency) {
+        out_msg.LineAddress := in_msg.LineAddress;
+        out_msg.MessageSize := MessageSizeType:Control;
+        out_msg.Destination.add(in_msg.Sender);
+        out_msg.Type := CoherenceMessageType:BIRspSL2;
+        out_msg.Sender := machineID;
+      }
+    }
+  }
+
+  action(birSB_BIRspS, "birSB", desc="CXL BIRspS after bisnp") {
+    peek(bisnpfrom_in, CoherenceMessage) {
+      enqueue(birspto_out, CoherenceMessage, l2_response_latency) {
+        out_msg.LineAddress := in_msg.LineAddress;
+        out_msg.MessageSize := MessageSizeType:Control;
+        out_msg.Destination.add(in_msg.Sender);
+        out_msg.Type := CoherenceMessageType:BIRspSL2;
+        out_msg.Sender := machineID;
+      }
+    }
+  }
+
+  action(art_sendAtomicResponseTBE, "art", desc="send Atomic Ack") {
+    assert(is_valid(tbe));
+    enqueue(responseToCore_out, ResponseMsg, l2_response_latency + glc_atomic_latency, true) {
+      out_msg.addr := address;
+      out_msg.Type := CoherenceResponseType:TDSysResp;
+      out_msg.Destination.clear();
+      out_msg.Destination := tbe.Destination;
+      out_msg.Sender := machineID;
+      out_msg.MessageSize := MessageSizeType:Response_Data;
+      out_msg.instSeqNum := tbe.instSeqNum;
+      out_msg.DataBlk := cache_entry.DataBlk;
+      out_msg.isGLCSet := tbe.isGLCSet;
+      out_msg.isSLCSet := tbe.isSLCSet;
+    }
+    cache_entry.DataBlk.clearAtomicLogEntries();
+  }
+
+  action(pndr_popNDRFromIn, "pndr", desc="pop ndrfrom_in") {
+    ndrfrom_in.dequeue(clockEdge());
+  }
+  action(pdrs_popDRSFromIn, "pdrs", desc="pop drsfrom_in") {
+    drsfrom_in.dequeue(clockEdge());
+  }
+  action(pbsp_popBISnpFromIn, "pbsp", desc="pop bisnpfrom_in") {
+    bisnpfrom_in.dequeue(clockEdge());
+  }
+
+  action(rcd_ReceiveData, "rcd", desc="Receive data from CXL MemData") {
+    peek(drsfrom_in, CoherenceMessage) {
+      //Addr LineAddress := in_msg.LineAddress;
+      //TBE tbe := TBEs[LineAddress];
+      cache_entry.DataBlk := in_msg.cl;
+      DPRINTF(RubySlicc, "Writing to TCC: %s\n", in_msg);
+    }
+  }
+
+  action(ct_copyToTBE, "ct", desc="copy data to TBE") {
+    assert(is_valid(tbe));
+    tbe.Dirty := true;
+    tbe.DataBlk := cache_entry.DataBlk;
+    tbe.writeMask := cache_entry.writeMask;
+  }
+  // END ACTIONS
+
+  // BEGIN TRANSITIONS
+  // transitions from base
+  // Assumptions for ArrayRead/Write
+  // TBE checked before tags
+  // Data Read/Write requires Tag Read
+
+  // Stalling transitions do NOT check the tag array...and if they do,
+  // they can cause a resource stall deadlock!
+  // SLC load
+    transition({I__C__M, I__C__E, I__C__S}, RD_SLC) {TagArrayRead, DataArrayRead} {
+      p_profileHit;
+      ut_updateTag;
+      sd_sendData;
+      p_popRequestQueue;
+    }
+    transition(I__C__I, RD_SLC, I__C__IS) {TagArrayRead} {
+      p_profileMiss;
+      a_allocateBlock;
+      t_allocateTBE;
+      ut_updateTag;
+      mrs_MemRdS;
+      p_popRequestQueue;
+    }
+    transition(I__C__IS, CmpE, I__C__IE_CmpE) {TagArrayRead} {
+      pndr_popNDRFromIn;
+      wada_wakeUpAllDependentsAddr; // If we got data early, wake up dependents
+    }
+    transition(I__C__IE_CmpE, Data, I__C__E) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+      
+      rcd_ReceiveData;
+      sdr_sendDataResponse;
+      pdrs_popDRSFromIn;
+      dt_deallocateTBE;
+      wada_wakeUpAllDependentsAddr;
+    }
+    transition(I__C__IS, CmpS, I__C__IS_CmpS) {TagArrayRead} {
+      pndr_popNDRFromIn;
+      wada_wakeUpAllDependentsAddr; // If we got data early, wake up dependents
+    }
+    transition(I__C__IS_CmpS, Data, I__C__S) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+      rcd_ReceiveData;
+      sdr_sendDataResponse;
+      pdrs_popDRSFromIn;
+      dt_deallocateTBE;
+      wada_wakeUpAllDependentsAddr;
+    }
+
+
+    transition(V__C__E, RD_SLC, I__C__E) {TagArrayRead, TagArrayWrite, DataArrayRead} {
+      p_profileHit;
+      ut_updateTag;
+      sd_sendData;
+      p_popRequestQueue;
+    }
+    transition(V__C__S, RD_SLC, I__C__S) {TagArrayRead, TagArrayWrite, DataArrayRead} {
+      p_profileHit;
+      ut_updateTag;
+      sd_sendData;
+      p_popRequestQueue;
+    }
+    transition(V__C__M, RD_SLC, I__C__M) {TagArrayRead, TagArrayWrite, DataArrayRead} {
+      p_profileHit;
+      ut_updateTag;
+      sd_sendData;
+      p_popRequestQueue;
+    }
+    transition(V__C__P, RD_SLC, I__C__IS) {TagArrayRead, TagArrayWrite} {
+      // This is the same as I__C__I: We drop the GLC cached data
+      p_profileMiss;
+      ut_updateTag;
+      t_allocateTBE;
+      mrs_MemRdS;
+      p_popRequestQueue;
+    }
+
+    transition(M__C__E, RD_SLC, I__C__M) {TagArrayRead, TagArrayWrite, DataArrayRead} {
+      // this is equivalent to WB+GetM
+      p_profileHit;
+      ut_updateTag;
+      sd_sendData;
+      p_popRequestQueue;
+    }
+    transition(M__C__P, RD_SLC, I__C__PM_RD) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+      p_profileMiss; // We need to write back, thus getM. 
+      t_allocateTBE;
+      sd_sendData;
+      ut_updateTag;
+      mra_MemRdA; // GetM but we drop data
+      p_popRequestQueue;
+    }
+    transition(I__C__PM_RD, CmpE, I__C__PM_RD_CmpE) {TagArrayRead, TagArrayWrite} {
+      pndr_popNDRFromIn;
+      wada_wakeUpAllDependentsAddr;
+      dt_deallocateTBE;
+    }
+    transition(I__C__PM_RD_CmpE, Data, I__C__M) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+      pdrs_popDRSFromIn;
+      wada_wakeUpAllDependentsAddr;
+    }
+
+    // Stall all non stable states
+    transition({I__C__IS, I__C__IE_CmpE, I__C__IS_CmpS, I__C__SM, I__C__IM, I__C__IM_CmpE, I__C__PM, V__C__IP, V__C__IP_Cmp, M__C__MP, M__C__SP, M__C__IP, M__C__IP_Cmp, I__C__SM_atomic, I__C__IM_atomic, I__C__IM_atomic_CmpE, I__C__PM_atomic, M__C__SP_atomic, M__C__IP_atomic,M__C__IP_atomic_Cmp, I__C__SI_repl, I__C__MI_repl,I__C__PM_repl, I__C__PM_RD_CmpE, I__C__PM_CmpE, I__C__PM_atomic_CmpE, I__C__PM_repl_CmpE, V__C__P_flush_CmpE, I__C__MI_BISnpInv, V__C__MP_BISnpInv, I__C__MS_BISnpData, V__C__MS_BISnpData}, RD_SLC) {
+      st_stallAndWaitRequest;
+    }
+  // SLC store
+    transition({I__C__M, I__C__E}, ST_SLC, I__C__M) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+      p_profileHit;
+      ut_updateTag;
+      swb_sendWBAck;
+      wdb_writeDirtyBytes;
+      p_popRequestQueue;
+    }
+    transition(I__C__S, ST_SLC, I__C__SM) {TagArrayRead, TagArrayWrite} {
+      p_profileHit;
+      t_allocateTBE;
+      swb_sendWBAck;
+      ut_updateTag;
+      mia_MemInvA;
+      p_popRequestQueue;
+    }
+    transition(I__C__SM, CmpE, I__C__M) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+      wdbr_writeDirtyBytesResp;
+      dt_deallocateTBE;
+      pndr_popNDRFromIn;
+      wada_wakeUpAllDependentsAddr;
+    }
+
+    transition(I__C__I, ST_SLC, I__C__IM) {TagArrayRead} {
+      p_profileMiss;
+      a_allocateBlock;
+      t_allocateTBE;
+      swb_sendWBAck;
+      ut_updateTag;
+      mra_MemRdA; // GetM
+      p_popRequestQueue;
+    }
+    transition(I__C__IM, CmpE, I__C__IM_CmpE) {TagArrayRead} {
+      pndr_popNDRFromIn;
+      wada_wakeUpAllDependentsAddr; // If we got data early, wake up dependents
+    }
+    transition(I__C__IM_CmpE, Data, I__C__M) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+      rcd_ReceiveData;
+      wdbr_writeDirtyBytesResp;
+      pdrs_popDRSFromIn;
+      dt_deallocateTBE;
+      wada_wakeUpAllDependentsAddr;
+    }
+
+    transition(V__C__M, ST_SLC, I__C__M) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+      p_profileHit;
+      ut_updateTag;
+      swb_sendWBAck;
+      wdb_writeDirtyBytes;
+      p_popRequestQueue;
+    }
+    transition(V__C__E, ST_SLC, I__C__M) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+      p_profileHit;
+      ut_updateTag;
+      swb_sendWBAck;
+      wdb_writeDirtyBytes;
+      p_popRequestQueue;
+    }
+    transition(V__C__S, ST_SLC, I__C__SM) {TagArrayRead, TagArrayWrite} {
+      p_profileHit;
+      t_allocateTBE;
+      ut_updateTag;
+      mia_MemInvA;
+      p_popRequestQueue;
+    }
+    transition(V__C__P, ST_SLC, I__C__IM) {TagArrayRead, TagArrayWrite} {
+      p_profileMiss;
+      t_allocateTBE;
+      swb_sendWBAck;
+      ut_updateTag;
+      mra_MemRdA; // GetM
+      p_popRequestQueue;
+    }
+    transition(M__C__E, ST_SLC, I__C__M) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+      // this is equivalent to PutM+WB+GetM
+      p_profileHit;
+      ut_updateTag;
+      wdb_writeDirtyBytes;
+      p_popRequestQueue;
+    }
+
+    transition(M__C__P, ST_SLC, I__C__PM) {TagArrayRead, TagArrayWrite} {
+      // this is equivalent to PutM+WB+GetM
+      p_profileMiss;
+      t_allocateTBE;
+      swb_sendWBAck;
+      ut_updateTag;
+      mra_MemRdA; // GetM but we drop the data
+      p_popRequestQueue;
+    }
+    transition(I__C__PM, CmpE, I__C__PM_CmpE) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+      wdbr_writeDirtyBytesResp;
+      pndr_popNDRFromIn;
+      wada_wakeUpAllDependentsAddr;
+      dt_deallocateTBE;
+    }
+    transition(I__C__PM_CmpE, Data, I__C__M) {TagArrayRead, TagArrayWrite} {
+      pdrs_popDRSFromIn;
+      wada_wakeUpAllDependentsAddr;
+    }
+    // Stall all non stable states
+    transition({I__C__IS, I__C__IE_CmpE, I__C__IS_CmpS, I__C__SM, I__C__IM, I__C__IM_CmpE, I__C__PM, V__C__IP, V__C__IP_Cmp, M__C__MP, M__C__SP, M__C__IP, M__C__IP_Cmp, I__C__SM_atomic, I__C__IM_atomic, I__C__IM_atomic_CmpE, I__C__PM_atomic, M__C__SP_atomic, M__C__IP_atomic,M__C__IP_atomic_Cmp, I__C__SI_repl, I__C__MI_repl,I__C__PM_repl, I__C__PM_RD_CmpE, I__C__PM_CmpE, I__C__PM_atomic_CmpE, I__C__PM_repl_CmpE, V__C__P_flush_CmpE, I__C__MI_BISnpInv, V__C__MP_BISnpInv, I__C__MS_BISnpData, V__C__MS_BISnpData}, ST_SLC) {
+      st_stallAndWaitRequest;
+    }
+
+
+  // GLC load
+    transition(I__C__M, RD_GLC, V__C__M) {TagArrayRead, TagArrayWrite, DataArrayRead} {
+      p_profileHit;
+      ut_updateTag;
+      sd_sendData;
+      p_popRequestQueue;
+    }
+    transition(I__C__E, RD_GLC, V__C__E) {TagArrayRead, TagArrayWrite, DataArrayRead} {
+      p_profileHit;
+      ut_updateTag;
+      sd_sendData;
+      p_popRequestQueue;
+    }
+    transition(I__C__S, RD_GLC, V__C__S) {TagArrayRead, TagArrayWrite, DataArrayRead} {
+      p_profileHit;
+      ut_updateTag;
+      sd_sendData;
+      p_popRequestQueue;
+    }
+    transition(I__C__I, RD_GLC, V__C__IP) {TagArrayRead} {
+      p_profileMiss;
+      t_allocateTBE;
+      a_allocateBlock;
+      mrsc_MemRdSnpCur;
+      p_popRequestQueue;
+    }
+    transition(V__C__IP, Cmp, V__C__IP_Cmp) {TagArrayRead} {
+      pndr_popNDRFromIn;
+      wada_wakeUpAllDependentsAddr; // If we got data early, wake up dependents
+    }
+    transition(V__C__IP_Cmp, Data, V__C__P) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+
+      rcd_ReceiveData;
+      sdr_sendDataResponse;
+      pdrs_popDRSFromIn;
+      dt_deallocateTBE;
+      wada_wakeUpAllDependentsAddr;
+    }
+    
+
+    transition({V__C__M, V__C__E, V__C__S, V__C__P, M__C__P, M__C__E}, RD_GLC) {TagArrayRead, DataArrayRead} {
+      p_profileHit;
+      ut_updateTag;
+      sd_sendData;
+      p_popRequestQueue;
+    }
+    
+    // Stall all non stable states
+    transition({I__C__IS, I__C__IE_CmpE, I__C__IS_CmpS, I__C__SM, I__C__IM, I__C__IM_CmpE, I__C__PM, V__C__IP, V__C__IP_Cmp, M__C__MP, M__C__SP, M__C__IP, M__C__IP_Cmp, I__C__SM_atomic, I__C__IM_atomic, I__C__IM_atomic_CmpE, I__C__PM_atomic, M__C__SP_atomic, M__C__IP_atomic,M__C__IP_atomic_Cmp, I__C__SI_repl, I__C__MI_repl,I__C__PM_repl, I__C__PM_RD_CmpE, I__C__PM_CmpE, I__C__PM_atomic_CmpE, I__C__PM_repl_CmpE, V__C__P_flush_CmpE, I__C__MS_BISnpData}, RD_GLC) {
+      st_stallAndWaitRequest;
+    }
+  // GLC store
+    transition(I__C__M, ST_GLC, M__C__MP) {TagArrayRead, TagArrayWrite} {
+      p_profileMiss;
+      t_allocateTBE;
+      mwi_MemWrI;
+      p_popRequestQueue;
+    }
+
+    transition(I__C__E, ST_GLC, M__C__E) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+      p_profileHit;
+      ut_updateTag;
+      wdb_writeDirtyBytes;
+      swb_sendWBAck;
+      p_popRequestQueue;
+    }
+    transition(I__C__S, ST_GLC, M__C__SP) {TagArrayRead, TagArrayWrite} {
+      p_profileHit;
+      t_allocateTBE;
+      ut_updateTag;
+      ce_CleanEvict;
+      p_popRequestQueue;
+    }
+    transition(M__C__SP, Cmp, M__C__P) {TagArrayRead, TagArrayWrite} {
+      pndr_popNDRFromIn;
+      w_sendResponseWBAck; 
+      dt_deallocateTBE;
+      wada_wakeUpAllDependentsAddr;
+    } 
+    transition(I__C__I, ST_GLC, M__C__IP) {TagArrayRead} {
+      p_profileMiss;
+      t_allocateTBE;
+      a_allocateBlock;
+      mrsc_MemRdSnpCur;
+      p_popRequestQueue;
+    }
+
+    transition(V__C__P, ST_GLC, M__C__P) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+      p_profileHit;
+      ut_updateTag;
+      wdb_writeDirtyBytes;
+      swb_sendWBAck;
+      p_popRequestQueue;
+    }
+    transition(V__C__E, ST_GLC, M__C__E) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+      p_profileHit;
+      ut_updateTag;
+      wdb_writeDirtyBytes;
+      swb_sendWBAck;
+      p_popRequestQueue;
+    }
+    transition(V__C__S, ST_GLC, M__C__SP) {
+      p_profileHit;
+      t_allocateTBE;
+      ut_updateTag;
+      ce_CleanEvict;
+      p_popRequestQueue;
+    }
+    transition(V__C__M, ST_GLC, M__C__MP) {TagArrayRead, TagArrayWrite} {
+      p_profileMiss;
+      t_allocateTBE;
+      mwi_MemWrI;
+      p_popRequestQueue;
+    }
+    transition(M__C__MP, Cmp, M__C__P) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+      wdbr_writeDirtyBytesResp;
+      w_sendResponseWBAck;
+      pndr_popNDRFromIn;
+      dt_deallocateTBE;
+      wada_wakeUpAllDependentsAddr;
+    }
+
+    transition(M__C__IP, Cmp, M__C__IP_Cmp) {TagArrayRead} {
+      pndr_popNDRFromIn;
+      wada_wakeUpAllDependentsAddr; // If we got data early, wake up dependents
+    }
+    transition(M__C__IP_Cmp, Data, M__C__P) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+
+      rcd_ReceiveData;
+      wdbr_writeDirtyBytesResp;
+      w_sendResponseWBAck;
+      pdrs_popDRSFromIn;
+      dt_deallocateTBE;
+      wada_wakeUpAllDependentsAddr;
+    }
+    transition({M__C__P, M__C__E}, ST_GLC) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+    p_profileHit;
+    ut_updateTag;
+    wdb_writeDirtyBytes;
+    swb_sendWBAck;
+    p_popRequestQueue;
+  }
+
+    // Stall all non stable states
+    transition({I__C__IS, I__C__IE_CmpE, I__C__IS_CmpS, I__C__SM, I__C__IM, I__C__IM_CmpE, I__C__PM, V__C__IP, V__C__IP_Cmp, M__C__MP, M__C__SP, M__C__IP, M__C__IP_Cmp, I__C__SM_atomic, I__C__IM_atomic, I__C__IM_atomic_CmpE, I__C__PM_atomic, M__C__SP_atomic, M__C__IP_atomic,M__C__IP_atomic_Cmp, I__C__SI_repl, I__C__MI_repl,I__C__PM_repl, I__C__PM_RD_CmpE, I__C__PM_CmpE, I__C__PM_atomic_CmpE, I__C__PM_repl_CmpE, V__C__P_flush_CmpE, I__C__MI_BISnpInv, V__C__MP_BISnpInv, I__C__MS_BISnpData, V__C__MS_BISnpData}, ST_GLC) {
+      st_stallAndWaitRequest;
+    }
+  // SLC Atomic
+    transition({I__C__M, I__C__E}, Atomic_SLC, I__C__M) {TagArrayRead, TagArrayWrite, DataArrayWrite, AtomicALUOperation} {
+      p_profileHit;
+      ut_updateTag;
+      owm_orWriteMask;
+      pa_performAtomic;
+      ar_sendAtomicResponse;
+      p_popRequestQueue;
+    }
+    transition(I__C__S, Atomic_SLC, I__C__SM_atomic) {TagArrayRead, TagArrayWrite, DataArrayWrite, AtomicALUOperation} {
+      p_profileHit;
+      t_allocateTBE;
+      ut_updateTag;
+      mia_MemInvA;
+      owm_orWriteMask;
+      pa_performAtomic;
+      p_popRequestQueue;
+    }
+    transition(I__C__SM_atomic, CmpE, I__C__M) {TagArrayRead, TagArrayWrite} {
+      art_sendAtomicResponseTBE;
+      dt_deallocateTBE;
+      pndr_popNDRFromIn;
+      wada_wakeUpAllDependentsAddr;
+    }
+    //TODO: Check
+    //transition(I__C__SM_atomic, BISnpInv, I__C__SM_atomic) {TagArrayRead} {
+    //  bic_BIConflict;
+    //  pbsp_popBISnpFromIn;
+    //} 
+
+    transition(I__C__I, Atomic_SLC, I__C__IM_atomic) {TagArrayRead, TagArrayWrite} {
+      a_allocateBlock;
+      p_profileMiss;
+      t_allocateTBE;
+      ut_updateTag;
+      // GetM 
+      mra_MemRdA;
+      p_popRequestQueue;
+    }
+    transition(I__C__IM_atomic, CmpE, I__C__IM_atomic_CmpE) {TagArrayRead} {
+      pndr_popNDRFromIn;
+      wada_wakeUpAllDependentsAddr; // If we got data early, wake up dependents
+    }
+    transition(I__C__IM_atomic_CmpE, Data, I__C__M) {TagArrayRead, TagArrayWrite, DataArrayWrite, AtomicALUOperation} {
+      rcd_ReceiveData;
+      pa_performAtomic;
+      art_sendAtomicResponseTBE;
+      pdrs_popDRSFromIn;
+      dt_deallocateTBE;
+      wada_wakeUpAllDependentsAddr;
+    }
+
+    transition({V__C__M, V__C__E}, Atomic_SLC, I__C__M) {TagArrayRead, TagArrayWrite, DataArrayWrite, AtomicALUOperation} {
+      p_profileHit;
+      ut_updateTag;
+      owm_orWriteMask;
+      pa_performAtomic;
+      ar_sendAtomicResponse;
+      p_popRequestQueue;
+    }
+    transition(V__C__S, Atomic_SLC, I__C__SM_atomic) {TagArrayRead, TagArrayWrite, DataArrayWrite, AtomicALUOperation} {
+      p_profileHit;
+      t_allocateTBE;
+      ut_updateTag;
+      mia_MemInvA; // GetM without data response
+      owm_orWriteMask;
+      pa_performAtomic;
+      p_popRequestQueue;
+    }
+
+    transition(V__C__P, Atomic_SLC, I__C__IM_atomic) {TagArrayRead, TagArrayWrite} {
+      p_profileMiss;
+      t_allocateTBE;
+      ut_updateTag;
+      // GetM 
+      mra_MemRdA;
+      p_popRequestQueue;
+    }
+
+    transition(M__C__P, Atomic_SLC, I__C__PM_atomic) {TagArrayRead, TagArrayWrite, DataArrayWrite, AtomicALUOperation} {
+      p_profileMiss; // We need to write back, thus getM. 
+      t_allocateTBE;
+      ut_updateTag;
+      mra_MemRdA; // GetM but we drop data
+      pa_performAtomic;
+      p_popRequestQueue;
+    }
+    transition(I__C__PM_atomic, CmpE, I__C__PM_atomic_CmpE) {TagArrayRead, TagArrayWrite} {
+      art_sendAtomicResponseTBE;
+      dt_deallocateTBE;
+      pndr_popNDRFromIn;
+    }
+    transition(I__C__PM_atomic_CmpE, Data, I__C__M) {TagArrayRead, TagArrayWrite, DataArrayWrite, AtomicALUOperation} {
+      pdrs_popDRSFromIn;
+      wada_wakeUpAllDependentsAddr;
+    }
+
+
+    transition(M__C__E, Atomic_SLC, I__C__M) {TagArrayRead, TagArrayWrite, DataArrayWrite, AtomicALUOperation} {
+      // this is equivalent to WB+GetM
+      p_profileHit;
+      ut_updateTag;
+      owm_orWriteMask;
+      pa_performAtomic;
+      ar_sendAtomicResponse;
+      p_popRequestQueue;
+    }
+
+    // Stall all non stable states
+    transition({I__C__IS, I__C__IE_CmpE, I__C__IS_CmpS, I__C__SM, I__C__IM, I__C__IM_CmpE, I__C__PM, V__C__IP, V__C__IP_Cmp, M__C__MP, M__C__SP, M__C__IP, M__C__IP_Cmp, I__C__SM_atomic, I__C__IM_atomic, I__C__IM_atomic_CmpE, I__C__PM_atomic, M__C__SP_atomic, M__C__IP_atomic,M__C__IP_atomic_Cmp, I__C__SI_repl, I__C__MI_repl,I__C__PM_repl, I__C__PM_RD_CmpE, I__C__PM_CmpE, I__C__PM_atomic_CmpE, I__C__PM_repl_CmpE, V__C__P_flush_CmpE, I__C__MI_BISnpInv, V__C__MP_BISnpInv, I__C__MS_BISnpData, V__C__MS_BISnpData}, Atomic_SLC) {
+      st_stallAndWaitRequest;
+    }
+  // GLC Atomic
+    transition({I__C__M, V__C__M}, Atomic_GLC, M__C__MP) {TagArrayRead, TagArrayWrite, DataArrayWrite, AtomicALUOperation} {
+      p_profileHit;
+      t_allocateTBE;
+      ut_updateTag;
+      owm_orWriteMask;
+      pa_performAtomic;
+      ar_sendAtomicResponse;
+      mwi_MemWrI;
+      p_popRequestQueue;
+    }
+
+    transition({I__C__E, V__C__E, M__C__E}, Atomic_GLC, M__C__E) {TagArrayRead, TagArrayWrite, DataArrayWrite, AtomicALUOperation} {
+      p_profileHit;
+      ut_updateTag;
+      owm_orWriteMask;
+      pa_performAtomic;
+      ar_sendAtomicResponse;
+      p_popRequestQueue;
+    }
+    transition(I__C__S, Atomic_GLC, M__C__SP_atomic) {TagArrayRead, TagArrayWrite, DataArrayWrite, AtomicALUOperation} { 
+      p_profileHit;
+      t_allocateTBE;
+      ut_updateTag;
+      ce_CleanEvict;
+      owm_orWriteMask;
+      pa_performAtomic;
+      p_popRequestQueue;
+    }
+    transition(M__C__SP_atomic, Cmp, M__C__P) {TagArrayRead, TagArrayWrite} {
+      pndr_popNDRFromIn;
+      art_sendAtomicResponseTBE;
+      dt_deallocateTBE;
+      wada_wakeUpAllDependentsAddr;
+    }
+    transition(I__C__I, Atomic_GLC, M__C__IP_atomic) {TagArrayRead, TagArrayWrite} {
+      a_allocateBlock;
+      p_profileMiss;
+      t_allocateTBE;
+      ut_updateTag;
+      mrsc_MemRdSnpCur;
+      p_popRequestQueue;
+    }
+    transition(M__C__IP_atomic, Cmp, M__C__IP_atomic_Cmp) {TagArrayRead} {
+      pndr_popNDRFromIn;
+      wada_wakeUpAllDependentsAddr; // If we got data early, wake up dependents
+    }
+    transition(M__C__IP_atomic_Cmp, Data, M__C__P) {TagArrayRead, TagArrayWrite, DataArrayWrite, AtomicALUOperation} {
+      rcd_ReceiveData;
+      owm_orWriteMask;
+      pa_performAtomic;
+      art_sendAtomicResponseTBE;
+      pdrs_popDRSFromIn;
+      dt_deallocateTBE;
+      wada_wakeUpAllDependentsAddr;
+    }
+
+    transition(V__C__S, Atomic_GLC, M__C__SP_atomic) {TagArrayRead, TagArrayWrite, DataArrayWrite, AtomicALUOperation} { 
+      p_profileHit;
+      t_allocateTBE;
+      ut_updateTag;
+      ce_CleanEvict;
+      owm_orWriteMask;
+      pa_performAtomic;
+      p_popRequestQueue;
+    }
+    transition(V__C__P, Atomic_GLC, M__C__P) {TagArrayRead, TagArrayWrite, DataArrayWrite, AtomicALUOperation} {
+      p_profileMiss;
+      t_allocateTBE;
+      ut_updateTag;
+      owm_orWriteMask;
+      pa_performAtomic;
+      ar_sendAtomicResponse;
+      p_popRequestQueue;
+    }
+    transition(M__C__P, Atomic_GLC) {TagArrayRead, TagArrayWrite, DataArrayWrite, AtomicALUOperation} {
+      p_profileHit;
+      ut_updateTag;
+      owm_orWriteMask;
+      pa_performAtomic;
+      ar_sendAtomicResponse;
+      p_popRequestQueue;
+    }
+    
+    // Stall all non stable states
+    transition({I__C__IS, I__C__IE_CmpE, I__C__IS_CmpS, I__C__SM, I__C__IM, I__C__IM_CmpE, I__C__PM, V__C__IP, V__C__IP_Cmp, M__C__MP, M__C__SP, M__C__IP, M__C__IP_Cmp, I__C__SM_atomic, I__C__IM_atomic, I__C__IM_atomic_CmpE, I__C__PM_atomic, M__C__SP_atomic, M__C__IP_atomic,M__C__IP_atomic_Cmp, I__C__SI_repl, I__C__MI_repl,I__C__PM_repl, I__C__PM_RD_CmpE, I__C__PM_CmpE, I__C__PM_atomic_CmpE, I__C__PM_repl_CmpE, V__C__P_flush_CmpE, V__C__MP_BISnpInv, I__C__MS_BISnpData, V__C__MS_BISnpData}, Atomic_GLC) {
+      st_stallAndWaitRequest;
+    }
+  // InvCache
+    transition({I__C__M, I__C__E, I__C__S, I__C__I}, InvCache) {TagArrayRead} {
+      ir_invL2Resp;
+      p_popRequestQueue;
+    }
+    transition(V__C__M, InvCache, I__C__M) {TagArrayRead, TagArrayWrite} {
+      ir_invL2Resp;
+      p_popRequestQueue;
+    }
+    transition(V__C__E, InvCache, I__C__E) {TagArrayRead, TagArrayWrite} {
+      ir_invL2Resp;
+      p_popRequestQueue;
+    }
+    transition(V__C__S, InvCache, I__C__S) {TagArrayRead, TagArrayWrite} {
+      ir_invL2Resp;
+      p_popRequestQueue;
+    }
+    transition(V__C__P, InvCache, I__C__I) {TagArrayRead, TagArrayWrite} {
+      i_invL2;
+      ir_invL2Resp;
+      p_popRequestQueue;
+    }
+
+
+    // Notdefined for M state (M__C__P, M__C__E)
+      //transition(M__C__E, InvCache, I__C__M) {TagArrayRead, TagArrayWrite} {
+      //  ir_invL2Resp;
+      //  p_popRequestQueue;
+      //}
+
+  // L2_Repl
+    transition({I__C__I, V__C__P}, L2_Repl, I__C__I) {TagArrayRead} {
+      i_invL2;
+    }
+    transition({I__C__E, I__C__S, V__C__E, V__C__S}, L2_Repl, I__C__SI_repl) {TagArrayRead, TagArrayWrite} {
+      t_allocateTBE;
+      ct_copyToTBE;
+      i_invL2;
+      ce_CleanEvict;
+    }
+
+    transition(I__C__SI_repl, Cmp, I__C__I) {TagArrayRead, TagArrayWrite} {
+      pndr_popNDRFromIn;
+      dt_deallocateTBE;
+      wada_wakeUpAllDependentsAddr;
+    }
+    
+    transition({I__C__M, V__C__M, M__C__E}, L2_Repl, I__C__MI_repl) {TagArrayRead, TagArrayWrite} {
+      t_allocateTBE;
+      ct_copyToTBE;
+      mwi_MemWrI; // WB+PutX 
+      i_invL2;
+    }
+
+    transition(I__C__MI_repl, Cmp, I__C__I) {TagArrayRead, TagArrayWrite} {
+      pndr_popNDRFromIn;
+      wada_wakeUpAllDependentsAddr;
+      dt_deallocateTBE;
+    }
+    // Conflicts while Replacing
+      transition(I__C__MI_repl, BISnpInv, I__C__MI_repl) {TagArrayRead} {
+        pbsp_popBISnpFromIn;
+        bic_BIConflict;
+      }
+      transition(I__C__MI_repl, BISnpData, I__C__MI_repl) {TagArrayRead} {
+        pbsp_popBISnpFromIn;
+        bic_BIConflict;
+      }
+      // This shouldn't happen as BIConflictAck should push Cmp 
+      transition(I__C__MI_repl, BIConflictAck, I__C__MI_repl) {TagArrayRead} {
+        birI_BIRspI;
+        pndr_popNDRFromIn;
+      }
+
+    transition(M__C__P, L2_Repl, I__C__PM_repl) {TagArrayRead, TagArrayWrite} {
+      t_allocateTBE;
+      ct_copyToTBE;
+      mra_MemRdA; // GetM but we drop the data later
+    } 
+    transition(I__C__PM_repl, CmpE, I__C__PM_repl_CmpE) {TagArrayRead, TagArrayWrite} {
+      pndr_popNDRFromIn;
+      wada_wakeUpAllDependentsAddr;
+    }
+    transition(I__C__PM_repl_CmpE, Data, I__C__MI_repl) {TagArrayRead, TagArrayWrite} {
+      mwi_MemWrI;
+      pdrs_popDRSFromIn;
+    }
+    // Dont Replace while Replacing
+    transition({I__C__SI_repl, I__C__MI_repl, I__C__PM_repl}, L2_Repl) {
+    }
+
+  
+
+  // FLUSH
+    transition({I__C__M, I__C__E, I__C__S, I__C__I}, Flush) {
+      fw_sendFlushResponse;
+      p_popRequestQueue;
+    }
+    transition(V__C__M, Flush, I__C__M) {TagArrayRead, TagArrayWrite} {
+      fw_sendFlushResponse;
+      p_popRequestQueue;
+    }
+    transition(V__C__E, Flush, I__C__E) {TagArrayRead, TagArrayWrite} {
+      fw_sendFlushResponse;
+      p_popRequestQueue;
+    }
+    transition(V__C__S, Flush, I__C__S) {TagArrayRead, TagArrayWrite} {
+      fw_sendFlushResponse;
+      p_popRequestQueue;
+    }
+    transition(V__C__P, Flush, V__C__P_flush) {TagArrayRead, TagArrayWrite} {
+      // We need to write back the data to memory
+      t_allocateTBE;
+      mra_MemRdA; // GetM, but we drop the data 
+      p_popRequestQueue;
+    }//TODO: Conflict?
+    transition(V__C__P_flush, CmpE, V__C__P_flush_CmpE) {TagArrayRead, TagArrayWrite} {
+      fw_sendFlushResponse;
+      pndr_popNDRFromIn;
+      wada_wakeUpAllDependentsAddr;
+    }
+    transition(V__C__P_flush_CmpE, Data, I__C__M) {TagArrayRead, TagArrayWrite} {
+      pdrs_popDRSFromIn;
+      dt_deallocateTBE;
+      wada_wakeUpAllDependentsAddr;
+    }
+   
+    // TODO? M__C__* states?
+  // Conflicts
+    transition(I__C__IS_CmpS, BISnpData) {TagArrayRead} {
+      birSB_BIRspS;
+      pbsp_popBISnpFromIn;
+    }
+    transition(I__C__IE_CmpE, BISnpData, I__C__IS_CmpS) {TagArrayRead} {
+      birSB_BIRspS;
+      pbsp_popBISnpFromIn;
+    }
+    transition({I__C__IM_CmpE,  I__C__PM_RD_CmpE, I__C__PM_CmpE}, BISnpData) {TagArrayRead} {
+      stB_stallAndWaitBI;
+    }
+    transition({I__C__IE_CmpE, I__C__IS_CmpS, I__C__IM_CmpE,  I__C__PM_RD_CmpE, I__C__PM_CmpE}, BISnpInv) {TagArrayRead} {
+      stB_stallAndWaitBI;
+    }
+    
+
+  //TODO BISnpInv on non coherent loads? (V__C__IP, M__C__IP, M__C__IP_atomic)
+    transition({I__C__IS, I__C__SM, I__C__IM, I__C__PM, M__C__MP, M__C__SP}, BISnpInv) {TagArrayRead} {
+      bic_BIConflict;
+      pbsp_popBISnpFromIn;
+    }
+    transition({I__C__IS, I__C__SM, I__C__IM, I__C__PM, M__C__MP, M__C__SP}, BISnpData) {TagArrayRead} {
+      bic_BIConflict;
+      pbsp_popBISnpFromIn;
+    }
+    transition({I__C__IS, I__C__PM, I__C__IM}, BIConflictAck) {TagArrayRead} {
+      birI_BIRspI;
+      pndr_popNDRFromIn;
+    }
+    //TODO: Check these. We getM without data response. thus IM will deadlock
+    transition(I__C__SM, BIConflictAck, I__C__IM) {TagArrayRead} {
+      birI_BIRspI;
+      pndr_popNDRFromIn;
+    }
+    transition(I__C__SM_atomic, BIConflictAck, I__C__IM_atomic) {TagArrayRead} {
+      birI_BIRspI;
+      pndr_popNDRFromIn;
+    }
+    // TODO: transitions to I should also handle BIConflictAck!
+
+    // Atomics always will conflict!
+    transition({I__C__SM_atomic, I__C__IM_atomic, I__C__IM_atomic_CmpE, I__C__PM_atomic, M__C__SP_atomic, M__C__IP_atomic, M__C__IP_atomic_Cmp}, BISnpInv) {
+      st_stallAndWaitRequest;
+      //bic_BIConflict;
+      //pbsp_popBISnpFromIn;
+    }
+    transition({I__C__SM_atomic, I__C__IM_atomic, I__C__IM_atomic_CmpE, I__C__PM_atomic, M__C__SP_atomic, M__C__IP_atomic, M__C__IP_atomic_Cmp}, BISnpData) {
+      st_stallAndWaitRequest;
+      //bic_BIConflict;
+      //pbsp_popBISnpFromIn;
+    }
+    // TODO: Handle BIConflictAck for atomic states!
+  // BISnpInv === GetM 
+    transition({I__C__M}, BISnpInv, I__C__MI_BISnpInv) {TagArrayRead, TagArrayWrite} {
+      t_allocateTBE;
+      mwi_MemWrI;
+      pbsp_popBISnpFromIn;
+    }
+    transition(I__C__MI_BISnpInv, Cmp, I__C__I) {TagArrayRead, TagArrayWrite} {
+      birI_BIRspI;
+      i_invL2;
+      pndr_popNDRFromIn;
+      dt_deallocateTBE;
+      wada_wakeUpAllDependentsAddr;
+    }
+    transition({I__C__E, I__C__S, I__C__I}, BISnpInv, I__C__I) {TagArrayRead, TagArrayWrite, DataArrayWrite} {
+      birIB_BIRspI;
+      i_invL2;
+      pbsp_popBISnpFromIn;
+    }
+
+    transition(V__C__M, BISnpInv, V__C__MP_BISnpInv) {TagArrayRead, TagArrayWrite} {
+      t_allocateTBE;
+      mwi_MemWrI;
+      pbsp_popBISnpFromIn;
+    }
+    transition(V__C__MP_BISnpInv, Cmp, V__C__P) {TagArrayRead, TagArrayWrite} {
+      birI_BIRspI;
+      pndr_popNDRFromIn;
+      dt_deallocateTBE;
+      wada_wakeUpAllDependentsAddr;
+    }
+    transition({V__C__E, V__C__S, V__C__P}, BISnpInv, V__C__P) {TagArrayRead, TagArrayWrite} {
+      birIB_BIRspI;
+      pbsp_popBISnpFromIn;
+    }
+
+    transition({M__C__E, M__C__P}, BISnpInv, M__C__P) {TagArrayRead, TagArrayWrite} {
+      birIB_BIRspI;
+      pbsp_popBISnpFromIn;
+    }
+
+  // SnpData === GetS
+    transition({I__C__M}, BISnpData, I__C__MS_BISnpData) {TagArrayRead, TagArrayWrite} {
+      t_allocateTBE;
+      mws_MemWrS;
+      pbsp_popBISnpFromIn;
+    }
+    transition(I__C__MS_BISnpData, Cmp, I__C__S ) {TagArrayRead, TagArrayWrite} {
+      birS_BIRspS;
+      pndr_popNDRFromIn;
+      dt_deallocateTBE;
+      wada_wakeUpAllDependentsAddr;
+    }
+    transition({I__C__E, I__C__S}, BISnpData, I__C__S) {TagArrayRead, TagArrayWrite} {
+      birSB_BIRspS;
+      pbsp_popBISnpFromIn;
+    }
+    transition(I__C__I, BISnpData) {TagArrayRead} {
+      birIB_BIRspI;
+      pbsp_popBISnpFromIn;
+    }
+    transition({V__C__M}, BISnpData, V__C__MS_BISnpData) {TagArrayRead, TagArrayWrite} {
+      t_allocateTBE;
+      mws_MemWrS;
+      pbsp_popBISnpFromIn;
+    }
+    transition(V__C__MS_BISnpData, Cmp, V__C__S) {TagArrayRead, TagArrayWrite} {
+      birS_BIRspS;
+      pndr_popNDRFromIn;
+      dt_deallocateTBE;
+      wada_wakeUpAllDependentsAddr;
+    }
+    transition({V__C__E, V__C__S}, BISnpData, V__C__S) {TagArrayRead, TagArrayWrite} {
+      birSB_BIRspS;
+      pbsp_popBISnpFromIn;
+    }
+    transition({V__C__P, M__C__P}, BISnpData) {TagArrayRead} {
+      birIB_BIRspI;
+      pbsp_popBISnpFromIn;
+    }
+    transition(M__C__E, BISnpData, M__C__P) {TagArrayRead, TagArrayWrite} {
+      birI_BIRspI;
+      pbsp_popBISnpFromIn;
+    }
+    // All stable states will respond with BIRespI to a BIConflictAck, invalidate themselves
+    transition({I__C__E, I__C__S, I__C__I}, BIConflictAck, I__C__I) {TagArrayRead, TagArrayWrite} {
+      birI_BIRspI;
+      pndr_popNDRFromIn;
+      i_invL2;
+      wada_wakeUpAllDependentsAddr;
+    }
+
+    transition({V__C__E, V__C__S, V__C__P, M__C__E, M__C__P}, BIConflictAck, V__C__P) {TagArrayRead, TagArrayWrite} {
+      birI_BIRspI;
+      pndr_popNDRFromIn;
+      wada_wakeUpAllDependentsAddr;
+    }
+    transition(I__C__M, BIConflictAck, I__C__MI_BISnpInv) {TagArrayRead, TagArrayWrite} {
+      pndr_popNDRFromIn;
+      t_allocateTBE;
+      mwi_MemWrI;
+      wada_wakeUpAllDependentsAddr;
+    }
+
+  // Stall data while waiting for cmp
+  transition({I__C__IS, I__C__PM_RD, I__C__SM, I__C__IM, I__C__PM, I__C__SM_atomic, I__C__IM_atomic, I__C__PM_atomic, I__C__PM_repl, V__C__P_flush, V__C__IP, M__C__IP, M__C__IP_atomic}, Data) {
+    stD_stallAndWaitData;
+  }
+}
