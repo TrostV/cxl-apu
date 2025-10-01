@@ -33,8 +33,41 @@ Running the simulation is done with: (this should also be run within the docker)
 > Number of CPUs must be >2 else the simulation will fail.
 > See [this](https://www.mail-archive.com/gem5-users@gem5.org/msg19940.html)
 
-## Benchmarks
-### SLC Microbench
+# Benchmarks
+## Rodinia Benchmark
+We adapt the [Rodinia Benchmark suite](https://github.com/yuhc/gpu-rodinia) to hip in `rodinia_hip`.
+Compile it in the `gcn-gpu` docker with:
+```
+/rodinia-hip $ make
+```
+Be sure to get the data provided with hip as mentioned in its [README](rodinia_hip/README).
+It seems the virginia link is down, get it from the provided dropbox link instead.
+
+Then run it with the cxl apu using:
+```
+/rodinia_hip/bin $ ./run.sh all
+```
+Or with the original VIPER
+```
+/rodinia_hip/bin $ GEM5=/gem5/build/VEGA_X86/gem5.opt SUFFIX=orig ./run.sh all
+```
+> [!NOTE]
+> You can compile the original VIPER implemenation with `scons build/VEGA_X86/gem5.opt -j<number_of_cores>`
+You can also run individual benchmarks by replacing `all` with the benchmark name, e.g. `hotspot`.
+The latency for the CXL APU can be specified by setting the environment variable `LATENCY`, e.g.
+``` 
+/rodinia_hip/bin $ LATENCY=200 ./run.sh gaussian
+```
+
+To extract the statistics used in the thesis, run
+```
+/rodinia_hip/bin $ LATENCY=120 ./extract.sh tcc_hitrate # or overall_rtime, overall_ipc, latency_rtime
+```
+To extract the statistics for the original VIPER, run
+```
+/rodinia_hip/bin $ SUFFIX=orig ./extract.sh tcc_hitrate # or overall_rtime, overall_ipc
+```
+## SLC Microbench
 We implement our SLC microbenchmark in `slc_microbench`. Compile it in the `gcn-gpu` docker with:
 ```
 /slc_microbench $ make
@@ -47,15 +80,12 @@ Or with the original VIPER
 ```
 /slc_microbench $ GEM5=/gem5/build/VEGA_X86/gem5.opt SUFFIX=orig ./run_all.sh
 ```
-> [!NOTE]
-> You can compile the original VIPER implemenation with `scons build/VEGA_X86/gem5.opt -j<number_of_cores>`
-
 To extract the statistics used in the thesis, run
 ```
 /slc_microbench $ ./extract_stats.sh
 ``` 
 or 
 ```
-/slc_microbench $  SUFFIX=orig ./extract_stats.sh
+/slc_microbench $ SUFFIX=orig ./extract_stats.sh
 ```
 respectively.
