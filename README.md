@@ -30,5 +30,6 @@ Running the simulation is done with: (this should also be run within the docker)
 /gem5/build/cxl_apu/gem5.opt /gem5/configs/example/apu_se.py -c <BINARY-PATH> -u <NUMBER_CUS> -n <NUMBER_CORES>
 ```
 > [!WARNING]
-> Number of CUs must be >=3 else the simulation will deadlock.
+> Number of CPUs must be >2 else the simulation will fail.
+> See [this](https://www.mail-archive.com/gem5-users@gem5.org/msg19940.html)
 
